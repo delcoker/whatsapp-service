@@ -10,8 +10,13 @@ const PORT = process.env.PORT || 3001;
 
 app.use(express.json());
 
-const client = new Client();
+const client = new Client({
+    puppeteer: {
+        args: ['--no-sandbox', '--disable-setuid-sandbox']
+    }
+});
 
+// Events
 client.on('qr', (qr) => {
     console.log('📱 QR Code received! Scan this with your WhatsApp:');
     qrcode.generate(qr, { small: true });
