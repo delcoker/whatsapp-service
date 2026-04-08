@@ -11,75 +11,116 @@ dotenv.config();
 const app = express();
 const PORT = process.env.PORT || 3001;
 
-// Middleware
 app.use(cors());
 app.use(express.json());
 
-// Store QR code
+// ── State ─────────────────────────────────────────────────────────────────────
+
 let currentQR = null;
 let clientReady = false;
+let isReconnecting = false;
+let client = null;
 
-// Simple serial message queue — prevents concurrent Puppeteer calls timing out
+// Serial send queue — prevents concurrent Puppeteer calls
 let sendQueue = Promise.resolve();
 const queueSend = (fn) => {
-  sendQueue = sendQueue.then(fn).catch(() => {}); // keep chain alive on error
+  sendQueue = sendQueue.then(fn).catch(() => {});
   return sendQueue;
 };
 
-// Initialize WhatsApp client with increased protocolTimeout
-const client = new Client({
-  authStrategy: new LocalAuth(),
-  puppeteer: {
-    args: ["--no-sandbox", "--disable-setuid-sandbox"],
-    protocolTimeout: 60000, // 60 s — up from default 30 s
-  },
-});
+// ── Client factory ────────────────────────────────────────────────────────────
 
-// Events
-client.on("qr", (qr) => {
-  currentQR = qr;
-  console.log("📱 QR Code received! Visit /qr to view it");
-});
+function createClient() {
+  const c = new Client({
+    authStrategy: new LocalAuth(),
+    puppeteer: {
+      args: ["--no-sandbox", "--disable-setuid-sandbox"],
+      protocolTimeout: 60000,
+    },
+  });
 
-client.on("ready", () => {
-  console.log("✅ WhatsApp client is ready!");
-  currentQR = null;
-  clientReady = true;
-});
+  c.on("qr", (qr) => {
+    currentQR = qr;
+    console.log("📱 QR Code received! Visit /qr to view it");
+  });
 
-client.on("disconnected", (reason) => {
-  console.log("❌ Client disconnected:", reason);
-  clientReady = false;
-});
+  c.on("ready", () => {
+    console.log("✅ WhatsApp client is ready!");
+    currentQR = null;
+    clientReady = true;
+    isReconnecting = false;
+  });
 
-client.on("auth_failure", () => {
-  console.log("❌ Authentication failed");
-  clientReady = false;
-});
+  c.on("auth_failure", () => {
+    console.log("❌ Authentication failed");
+    clientReady = false;
+    scheduleReconnect();
+  });
 
-// Initialize client
-console.log("🚀 Starting WhatsApp service...");
-client.initialize();
+  c.on("disconnected", (reason) => {
+    console.log("❌ Client disconnected:", reason);
+    clientReady = false;
+    scheduleReconnect();
+  });
 
-// ── Helpers ──────────────────────────────────────────────────────────────────
-
-function guardReady(res) {
-  if (!clientReady) {
-    res.status(503).json({ error: "WhatsApp client not ready yet" });
-    return false;
-  }
-  return true;
+  return c;
 }
+
+// ── Reconnect logic ───────────────────────────────────────────────────────────
+
+async function scheduleReconnect() {
+  if (isReconnecting) {
+    console.log("🔄 Reconnect already in progress, skipping");
+    return;
+  }
+  isReconnecting = true;
+  console.log("🔄 Reconnecting in 5 seconds...");
+
+  await new Promise((r) => setTimeout(r, 5000));
+
+  try {
+    if (client) {
+      try { await client.destroy(); } catch (_) {}
+    }
+
+    console.log("🆕 Creating new client instance...");
+    client = createClient();
+    await client.initialize();
+  } catch (err) {
+    console.error("💥 Reconnect failed:", err.message);
+    isReconnecting = false;
+    scheduleReconnect();
+  }
+}
+
+// ── Unhandled error safety net ────────────────────────────────────────────────
+
+process.on("uncaughtException", (err) => {
+  console.error("💥 Uncaught exception:", err.message);
+});
+
+process.on("unhandledRejection", (reason) => {
+  console.error("💥 Unhandled rejection:", reason);
+});
+
+// ── Helpers ───────────────────────────────────────────────────────────────────
 
 function toWhatsAppId(phoneNumber) {
   return phoneNumber.replace(/\D/g, "") + "@c.us";
+}
+
+function withTimeout(promise, ms = 45000) {
+  const timer = new Promise((_, reject) =>
+      setTimeout(() => reject(new Error(`Timed out after ${ms}ms`)), ms)
+  );
+  return Promise.race([promise, timer]);
 }
 
 async function safeSend(whatsappNumber, text) {
   return new Promise((resolve, reject) => {
     queueSend(async () => {
       try {
-        await client.sendMessage(whatsappNumber, text);
+        await withTimeout(client.sendMessage(whatsappNumber, text));
         resolve();
       } catch (err) {
         reject(err);
@@ -90,12 +131,15 @@ async function safeSend(whatsappNumber, text) {
 
 // ── Routes ────────────────────────────────────────────────────────────────────
 
-// Health check
 app.get("/health", (req, res) => {
-  res.json({ status: "ok", ready: clientReady, timestamp: new Date().toISOString() });
+  res.status(clientReady ? 200 : 503).json({
+    status: clientReady ? "ok" : "degraded",
+    ready: clientReady,
+    reconnecting: isReconnecting,
+    timestamp: new Date().toISOString(),
+  });
 });
 
-// QR Code endpoint — serves as HTML page
 app.get("/qr", async (req, res) => {
   try {
     if (!currentQR) {
@@ -103,29 +147,22 @@ app.get("/qr", async (req, res) => {
         error: "No QR code available. Already authenticated or waiting...",
       });
     }
-
     const qrImage = await qrcodeLib.toDataURL(currentQR);
     res.send(`
-      <!DOCTYPE html>
-      <html>
-      <head>
-        <title>WhatsApp QR Code</title>
-        <style>
-          body { display: flex; justify-content: center; align-items: center; min-height: 100vh; background: #000; margin: 0; }
-          .container { text-align: center; padding: 20px; }
-          h1 { color: #25d366; font-family: Arial; }
-          img { border: 2px solid #25d366; padding: 10px; background: white; }
-          p { color: #888; font-family: Arial; }
-        </style>
-      </head>
-      <body>
-        <div class="container">
-          <h1>📱 Scan with WhatsApp</h1>
-          <img src="${qrImage}" alt="WhatsApp QR Code" width="400" height="400">
-          <p>Scan this with WhatsApp Settings → Linked Devices → Link a device</p>
-        </div>
-      </body>
-      </html>
+      <!DOCTYPE html><html>
+      <head><title>WhatsApp QR Code</title>
+      <style>
+        body{display:flex;justify-content:center;align-items:center;min-height:100vh;background:#000;margin:0}
+        .container{text-align:center;padding:20px}
+        h1{color:#25d366;font-family:Arial}
+        img{border:2px solid #25d366;padding:10px;background:white}
+        p{color:#888;font-family:Arial}
+      </style></head>
+      <body><div class="container">
+        <h1>📱 Scan with WhatsApp</h1>
+        <img src="${qrImage}" alt="WhatsApp QR Code" width="400" height="400">
+        <p>Scan this with WhatsApp Settings → Linked Devices → Link a device</p>
+      </div></body></html>
     `);
   } catch (error) {
     console.error("❌ Error generating QR:", error);
@@ -133,44 +170,40 @@ app.get("/qr", async (req, res) => {
   }
 });
 
-// Send receipt
 app.post("/send-receipt", async (req, res) => {
-  if (!guardReady(res)) return;
-
+  if (!clientReady) {
+    return res.status(503).json({ error: "WhatsApp client not ready", reconnecting: isReconnecting });
+  }
   const { phoneNumber, receiptText } = req.body;
   if (!phoneNumber || !receiptText) {
     return res.status(400).json({ error: "Missing phoneNumber or receiptText" });
   }
-
   const whatsappNumber = toWhatsAppId(phoneNumber);
   console.log(`📤 Queuing receipt → ${whatsappNumber}`);
-
   try {
     await safeSend(whatsappNumber, receiptText);
     res.json({ success: true, message: "Receipt sent successfully", phoneNumber, sentAt: new Date().toISOString() });
   } catch (error) {
-    console.error("❌ Error sending receipt:", error);
+    console.error("❌ Error sending receipt:", error.message);
     res.status(500).json({ error: "Failed to send receipt", details: error.message });
   }
 });
 
-// Send generic message
 app.post("/send-message", async (req, res) => {
-  if (!guardReady(res)) return;
-
+  if (!clientReady) {
+    return res.status(503).json({ error: "WhatsApp client not ready", reconnecting: isReconnecting });
+  }
   const { phoneNumber, message } = req.body;
   if (!phoneNumber || !message) {
     return res.status(400).json({ error: "Missing phoneNumber or message" });
   }
-
   const whatsappNumber = toWhatsAppId(phoneNumber);
   console.log(`📤 Queuing message → ${whatsappNumber}`);
-
   try {
     await safeSend(whatsappNumber, message);
     res.json({ success: true, message: "Message sent successfully", phoneNumber, sentAt: new Date().toISOString() });
   } catch (error) {
-    console.error("❌ Error sending message:", error);
+    console.error("❌ Error sending message:", error.message);
     res.status(500).json({ error: "Failed to send message", details: error.message });
   }
 });
@@ -183,8 +216,12 @@ app.listen(PORT, () => {
   console.log(`📱 View QR code at:  http://localhost:${PORT}/qr`);
 });
 
-process.on("SIGINT", () => {
+console.log("🚀 Starting WhatsApp service...");
+client = createClient();
+client.initialize();
+
+process.on("SIGINT", async () => {
   console.log("\n🛑 Shutting down...");
-  client.destroy();
+  if (client) await client.destroy().catch(() => {});
   process.exit();
 });
